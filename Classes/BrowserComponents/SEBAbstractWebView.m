@@ -1,0 +1,1349 @@
+//
+//  SEBAbstractWebView.m
+//  Safe Exam Browser
+//
+//  Created by Daniel R. Schneider on 04.11.20.
+//  Copyright (c) 2010-2025 Daniel R. Schneider, ETH Zurich, IT Services,
+//  based on the original idea of Safe Exam Browser
+//  by Stefan Schneider, University of Giessen
+//  Project concept: Thomas Piendl, Daniel R. Schneider, Damian Buechel,
+//  Dirk Bauer, Kai Reuter, Tobias Halbherr, Karsten Burger, Marco Lehre,
+//  Brigitte Schmucki, Oliver Rahs. French localization: Nicolas Dunand
+//
+//  ``The contents of this file are subject to the Mozilla Public License
+//  Version 2.0 (the "License"); you may not use this file except in
+//  compliance with the License. You may obtain a copy of the License at
+//  http://www.mozilla.org/MPL/
+//
+//  Software distributed under the License is distributed on an "AS IS"
+//  basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See the
+//  License for the specific language governing rights and limitations
+//  under the License.
+//
+//  The Original Code is Safe Exam Browser for Mac OS X.
+//
+//  The Initial Developer of the Original Code is Daniel R. Schneider.
+//  Portions created by Daniel R. Schneider are Copyright
+//  (c) 2010-2025 Daniel R. Schneider, ETH Zurich, IT Services,
+//  based on the original idea of Safe Exam Browser
+//  by Stefan Schneider, University of Giessen. All Rights Reserved.
+//
+//  Contributor(s): ______________________________________.
+//
+
+#import "SEBAbstractWebView.h"
+#import "SEBAbstractClassicWebView.h"
+#import "SafeExamBrowser-Swift.h"
+#if TARGET_OS_OSX
+#import "NSPasteboard+SaveRestore.h"
+#endif
+
+@implementation SEBAbstractWebView
+
+// See the header for the contract and for why this exists. Every
+// -evaluateJavaScript: call site that interpolates a page-supplied value goes
+// through here; none of them hand-roll escaping.
+//
+// The markers below are load-bearing: tools/lockdown-tests/run-js-escaping-test.sh
+// slices this exact region out of this file and compiles it, so the test exercises
+// the SHIPPED implementation rather than a copy that can drift. Do not remove or
+// rename them — the test fails loudly if it cannot find them.
+// BEGIN blinkeredJSStringLiteral
++ (NSString *) blinkeredJSStringLiteral:(NSString *)value
+{
+    NSString *string = [value isKindOfClass:[NSString class]] ? value : @"";
+    // NSJSONWritingFragmentsAllowed lets a bare string be the top-level value
+    // (macOS 10.15+; our deployment target is 11.0).
+    NSData *data = [NSJSONSerialization dataWithJSONObject:string
+                                                   options:NSJSONWritingFragmentsAllowed
+                                                     error:NULL];
+    NSString *literal = data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+    // Fail closed. A string NSJSONSerialization refuses (unpaired surrogates)
+    // becomes an empty literal rather than an unescaped one.
+    if (literal.length < 2) {
+        return @"\"\"";
+    }
+    // JSON leaves U+2028/U+2029 raw. ES2019 legalised them inside string
+    // literals, so this is belt-and-braces rather than a live hole — but
+    // "safe because of which ECMAScript edition the engine implements" is
+    // exactly the kind of unenumerated dependency that produced this bug.
+    literal = [literal stringByReplacingOccurrencesOfString:@"\u2028" withString:@"\\u2028"];
+    literal = [literal stringByReplacingOccurrencesOfString:@"\u2029" withString:@"\\u2029"];
+    return literal;
+}
+// END blinkeredJSStringLiteral
+
+- (instancetype)initNewTabMainWebView:(BOOL)mainWebView
+                       withCommonHost:(BOOL)commonHostTab
+                        configuration:(WKWebViewConfiguration *)configuration
+                   overrideSpellCheck:(BOOL)overrideSpellCheck
+                             delegate:(nonnull id<SEBAbstractWebViewNavigationDelegate>)delegate
+{
+    self = [super init];
+    _navigationDelegate = delegate;
+    if (self) {
+        _isMainBrowserWebView = mainWebView;
+        _isReloadAllowed = [_navigationDelegate isReloadAllowedMainWebView:mainWebView];
+        _showReloadWarning = [_navigationDelegate showReloadWarningMainWebView:mainWebView];
+        _isNavigationAllowed = [_navigationDelegate isNavigationAllowedMainWebView:mainWebView];
+        _overrideAllowSpellCheck = overrideSpellCheck;
+        urlFilter = [SEBURLFilter sharedSEBURLFilter];
+        NSUserDefaults *preferences = [NSUserDefaults standardUserDefaults];
+        quitURLTrimmed = [[[preferences secureStringForKey:@"org_safeexambrowser_SEB_quitURL"] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]] lowercaseString];
+        webViewSelectPolicies webViewSelectPolicy = [preferences secureIntegerForKey:@"org_safeexambrowser_SEB_browserWindowWebView"];
+        BOOL downloadingInTemporaryWebView = overrideSpellCheck;
+        _allowSpellCheck = !_overrideAllowSpellCheck && [preferences secureBoolForKey:@"org_safeexambrowser_SEB_allowSpellCheck"];
+        _downloadPDFFiles = [preferences secureBoolForKey:@"org_safeexambrowser_SEB_downloadPDFFiles"];
+
+#if TARGET_OS_IPHONE
+                // Override webViewSelectPolicy
+                webViewSelectPolicy = webViewSelectForceModern;
+#endif
+
+        if (webViewSelectPolicy != webViewSelectForceClassic || downloadingInTemporaryWebView) {
+            BOOL sendBrowserExamKey = [preferences secureBoolForKey:@"org_safeexambrowser_SEB_sendBrowserExamKey"];
+            if ((webViewSelectPolicy == webViewSelectAutomatic && !sendBrowserExamKey) ||
+                (webViewSelectPolicy == webViewSelectForceModern) ||
+                (webViewSelectPolicy == webViewSelectForceModernInForeignNewTabs && (!sendBrowserExamKey || !commonHostTab)) ||
+                downloadingInTemporaryWebView) {
+                
+                DDLogInfo(@"Opening modern WebView");
+                SEBAbstractModernWebView *sebAbstractModernWebView = [[SEBAbstractModernWebView alloc] initWithDelegate:self configuration:configuration];
+                self.browserControllerDelegate = sebAbstractModernWebView;
+                [self initGeneralProperties];
+                
+                return self;
+            }
+        }
+        DDLogInfo(@"Opening classic WebView");
+        SEBAbstractClassicWebView *sebAbstractClassicWebView = [[SEBAbstractClassicWebView alloc] initWithDelegate:self];
+        self.browserControllerDelegate = sebAbstractClassicWebView;
+        [self initGeneralProperties];
+    }
+    
+    return self;
+}
+
+- (void) initGeneralProperties
+{
+    NSUserDefaults *preferences = [NSUserDefaults standardUserDefaults];
+    [self.browserControllerDelegate setPrivateClipboardEnabled:[preferences secureBoolForKey:@"org_safeexambrowser_SEB_enablePrivateClipboard"] ||
+     [preferences secureBoolForKey:@"org_safeexambrowser_SEB_enablePrivateClipboardMacEnforce"]];
+    [self.browserControllerDelegate setAllowDictionaryLookup:[preferences secureBoolForKey:@"org_safeexambrowser_SEB_allowDictionaryLookup"]];
+    [self.browserControllerDelegate setAllowPDFPlugIn:[preferences secureBoolForKey:@"org_safeexambrowser_SEB_allowPDFPlugIn"]];
+}
+
+
+#pragma mark - SEBAbstractBrowserControllerDelegate Methods
+
+- (id)nativeWebView
+{
+    return self.browserControllerDelegate.nativeWebView;
+}
+
+- (void) closeWKWebView
+{
+    if ([self.browserControllerDelegate respondsToSelector:@selector(closeWKWebView)]) {
+        [self.browserControllerDelegate closeWKWebView];
+    }
+}
+
+- (NSURL*)url
+{
+    return [self.browserControllerDelegate url];
+}
+
+- (NSString*)pageTitle
+{
+    return [self.browserControllerDelegate pageTitle];
+}
+
+- (BOOL)canGoBack
+{
+    return [self.browserControllerDelegate canGoBack];
+}
+
+- (BOOL)canGoForward;
+{
+    return [self.browserControllerDelegate canGoForward];
+}
+
+- (void)goBack
+{
+    [self.browserControllerDelegate goBack];
+}
+
+- (void)goForward
+{
+    [self.browserControllerDelegate goForward];
+}
+
+- (void)reload
+{
+    if (self.isReloadAllowed == NO) {
+        return;
+    }
+    [self.browserControllerDelegate reload];
+}
+
+- (void)loadURL:(NSURL *)url
+{
+    if (url) {
+        [self.browserControllerDelegate loadURL:url];
+    }
+}
+
+- (void)stopLoading
+{
+    [self.browserControllerDelegate stopLoading];
+}
+
+- (void) focusFirstElement
+{
+    [self.browserControllerDelegate focusFirstElement];
+}
+
+- (void) focusLastElement
+{
+    [self.browserControllerDelegate focusLastElement];
+}
+
+- (BOOL) zoomPageSupported
+{
+    return self.browserControllerDelegate.zoomPageSupported;
+}
+
+- (void) zoomPageIn
+{
+    [self.browserControllerDelegate zoomPageIn];
+}
+
+- (void) zoomPageOut
+{
+    [self.browserControllerDelegate zoomPageOut];
+}
+
+- (void) zoomPageReset
+{
+    [self.browserControllerDelegate zoomPageReset];
+}
+
+- (void) textSizeIncrease
+{
+    [self.browserControllerDelegate textSizeIncrease];
+}
+
+- (void) textSizeDecrease
+{
+    [self.browserControllerDelegate textSizeDecrease];
+}
+
+- (void) textSizeReset
+{
+    [self.browserControllerDelegate textSizeReset];
+}
+
+
+- (void) searchText:(NSString *)textToSearch backwards:(BOOL)backwards caseSensitive:(BOOL)caseSensitive
+{
+    [self.browserControllerDelegate searchText:textToSearch backwards:backwards caseSensitive:caseSensitive];
+}
+
+
+- (void) privateCopy:(id)sender
+{
+    [self.browserControllerDelegate privateCopy:sender];
+}
+
+- (void) privateCut:(id)sender
+{
+    [self.browserControllerDelegate privateCut:sender];
+}
+
+- (void) privatePaste:(id)sender
+{
+    [self.browserControllerDelegate privatePaste:sender];
+}
+
+
+- (void)loadView
+{
+    [self.browserControllerDelegate loadView];
+}
+
+- (void)didMoveToParentViewController
+{
+    [self.browserControllerDelegate didMoveToParentViewController];
+}
+
+- (void)viewDidLayout
+{
+    [self.browserControllerDelegate viewDidLayout];
+}
+
+- (void)viewDidLayoutSubviews
+{
+    [self.browserControllerDelegate viewDidLayoutSubviews];
+}
+
+- (void)viewWillTransitionToSize
+{
+    [self.browserControllerDelegate viewWillTransitionToSize];
+}
+
+- (void) viewDidLoad
+{
+    [self.browserControllerDelegate viewDidLoad];
+}
+
+- (void)viewWillAppear
+{
+    [self.browserControllerDelegate viewWillAppear];
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [self.browserControllerDelegate viewWillAppear:(BOOL)animated];
+}
+
+- (void)viewDidAppear
+{
+    [self.browserControllerDelegate viewDidAppear];
+}
+
+- (void)viewDidAppear:(BOOL)animated
+{
+    [self.browserControllerDelegate viewDidAppear:(BOOL)animated];
+}
+
+- (void)viewWillDisappear
+{
+    [self.browserControllerDelegate viewWillDisappear];
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+    [self.browserControllerDelegate viewWillDisappear:(BOOL)animated];
+}
+
+- (void)viewWDidDisappear
+{
+    [self.browserControllerDelegate viewDidDisappear];
+}
+
+- (void)viewWDidDisappear:(BOOL)animated
+{
+    [self.browserControllerDelegate viewDidDisappear:(BOOL)animated];
+}
+
+
+- (void) stopMediaPlaybackWithCompletionHandler:(void (^)(void))completionHandler
+{
+    if ([self.browserControllerDelegate respondsToSelector:@selector(stopMediaPlaybackWithCompletionHandler:)]) {
+        [self.browserControllerDelegate stopMediaPlaybackWithCompletionHandler:completionHandler];
+    } else {
+        completionHandler();
+    }
+}
+
+
+- (void)toggleScrollLock
+{
+    if ([self.browserControllerDelegate respondsToSelector:@selector(toggleScrollLock)]) {
+        [self.browserControllerDelegate toggleScrollLock];
+    }
+}
+
+- (BOOL)isScrollLockActive
+{
+    if ([self.browserControllerDelegate respondsToSelector:@selector(isScrollLockActive)]) {
+        return [self.browserControllerDelegate isScrollLockActive];
+    }
+    return NO;
+}
+
+
+- (void)disableFlashFullscreen
+{
+#if TARGET_OS_OSX
+    [self.browserControllerDelegate disableFlashFullscreen];
+#endif
+}
+
+
+- (void)setDownloadingSEBConfig:(BOOL)downloadingSEBConfig
+{
+    if ([self.browserControllerDelegate respondsToSelector:@selector(downloadingSEBConfig)]) {
+        self.browserControllerDelegate.downloadingSEBConfig = downloadingSEBConfig;
+    }
+}
+
+
+#pragma mark - SEBAbstractWebViewNavigationDelegate Methods
+
+- (WKWebViewConfiguration *) wkWebViewConfiguration
+{
+    return self.navigationDelegate.wkWebViewConfiguration;
+}
+
+- (id<WKScriptMessageHandler>) blinkeredScriptMessageHandler
+{
+    // Optional protocol method — guard so a delegate that doesn't implement it
+    // can't crash with an unrecognized selector during webview setup.
+    if ([self.navigationDelegate respondsToSelector:@selector(blinkeredScriptMessageHandler)]) {
+        return self.navigationDelegate.blinkeredScriptMessageHandler;
+    }
+    return nil;
+}
+
+- (id) accessibilityDock
+{
+    return self.navigationDelegate.accessibilityDock;
+}
+
+- (void) setLoading:(BOOL)loading
+{
+    [self.navigationDelegate setLoading:loading];
+}
+
+- (void) setCanGoBack:(BOOL)canGoBack canGoForward:(BOOL)canGoForward
+{
+    [self.navigationDelegate setCanGoBack:canGoBack canGoForward:canGoForward];
+}
+
+- (void) examineCookies:(NSArray<NSHTTPCookie *>*)cookies forURL:(NSURL *)url
+{
+    [self.navigationDelegate examineCookies:cookies forURL:url];
+}
+
+- (void) examineHeaders:(NSDictionary<NSString *,NSString *>*)headerFields forURL:(NSURL *)url
+{
+    [self.navigationDelegate examineHeaders:headerFields forURL:url];
+}
+
+- (void) firstDOMElementDeselected
+{
+    if ([self.navigationDelegate respondsToSelector:@selector(firstDOMElementDeselected)]) {
+        [self.navigationDelegate firstDOMElementDeselected];
+   }
+}
+
+- (void) lastDOMElementDeselected
+{
+    if ([self.navigationDelegate respondsToSelector:@selector(lastDOMElementDeselected)]) {
+        [self.navigationDelegate lastDOMElementDeselected];
+    }
+}
+
+- (SEBAbstractWebView *) openNewTabWithURL:(NSURL *)url
+                             configuration:(WKWebViewConfiguration *)configuration
+{
+    return [self.navigationDelegate openNewTabWithURL:url configuration:configuration];
+}
+
+- (SEBAbstractWebView *) openNewWebViewWindowWithURL:(NSURL *)url
+                                       configuration:(WKWebViewConfiguration *)configuration
+{
+    return [self.navigationDelegate openNewWebViewWindowWithURL:url configuration:configuration];
+}
+
+- (void) makeActiveAndOrderFront
+{
+    [self.navigationDelegate makeActiveAndOrderFront];
+}
+
+- (void) showWebView:(SEBAbstractWebView *)webView
+{
+    [self.navigationDelegate showWebView:webView];
+}
+
+- (void) closeWebView
+{
+    [self.navigationDelegate closeWebView:self];
+}
+
+- (void) closeWebView:(SEBAbstractWebView *)webView
+{
+    [self.navigationDelegate closeWebView:webView];
+}
+
+- (void) addWebView:(id)nativeWebView
+{
+    if ([self.navigationDelegate respondsToSelector:@selector(addWebView:)]) {
+        [self.navigationDelegate addWebView:nativeWebView];
+    }
+}
+
+- (void) addWebViewController:(id)webViewController
+{
+    if ([self.navigationDelegate respondsToSelector:@selector(addWebViewController:)]) {
+        [self.navigationDelegate addWebViewController:webViewController];
+    }
+}
+
+- (SEBAbstractWebView *) abstractWebView
+{
+    return self;
+}
+
+- (NSURL *)currentURL
+{
+    return self.navigationDelegate.currentURL;
+}
+
+- (NSString *)currentMainHost
+{
+    return self.navigationDelegate.currentMainHost;
+}
+
+- (void)setCurrentMainHost:(NSString *)currentMainHost
+{
+    self.navigationDelegate.currentMainHost = currentMainHost;
+}
+
+- (BOOL)isMainBrowserWebViewActive
+{
+    return self.isMainBrowserWebView;
+}
+
+- (NSString *)quitURL
+{
+    return self.navigationDelegate.quitURL;
+}
+
+- (NSString *)pageJavaScript
+{
+    return self.navigationDelegate.pageJavaScript;
+}
+
+- (BOOL)allowDownloads
+{
+    return self.navigationDelegate.allowDownloads;
+}
+
+- (BOOL)allowUploads
+{
+    return self.navigationDelegate.allowUploads;
+}
+
+- (void)showAlertNotAllowedDownUploading:(BOOL)uploading
+{
+    [self.navigationDelegate showAlertNotAllowedDownUploading:uploading];
+}
+
+- (void)showAlertNotAllowedDownloadingAndOpeningSebConfig:(BOOL)downloading
+{
+    [self.navigationDelegate showAlertNotAllowedDownloadingAndOpeningSebConfig:downloading];
+}
+
+- (BOOL)overrideAllowSpellCheck
+{
+    return _overrideAllowSpellCheck;
+}
+
+- (BOOL)isUsingServerBEK
+{
+    return self.navigationDelegate.isUsingServerBEK;
+}
+
+- (NSURLRequest *)modifyRequest:(NSURLRequest *)request
+{
+    return [self.navigationDelegate modifyRequest:request];
+}
+
+- (NSString *) browserExamKeyForURL:(NSURL *)url
+{
+    return [self.navigationDelegate browserExamKeyForURL:url];
+}
+
+- (NSString *) configKeyForURL:(NSURL *)url
+{
+    return [self.navigationDelegate configKeyForURL:url];
+}
+
+- (NSString *) appVersion
+{
+    return [self.navigationDelegate appVersion];
+}
+
+
+- (void) searchTextMatchFound:(BOOL)matchFound
+{
+    [self.navigationDelegate searchTextMatchFound:matchFound];
+}
+
+
+@synthesize customSEBUserAgent;
+
+- (NSString *) customSEBUserAgent
+{
+    return self.navigationDelegate.customSEBUserAgent;
+    
+}
+
+
+- (NSArray <NSData *> *) privatePasteboardItems
+{
+    return self.navigationDelegate.privatePasteboardItems;
+}
+
+- (void) setPrivatePasteboardItems:(NSArray<NSData *> *)privatePasteboardItems
+{
+    self.navigationDelegate.privatePasteboardItems = privatePasteboardItems;
+}
+
+- (void) storePasteboard {
+#if TARGET_OS_OSX
+    NSPasteboard *generalPasteboard = [NSPasteboard generalPasteboard];
+    NSArray *archive = [generalPasteboard archiveObjects];
+    self.navigationDelegate.privatePasteboardItems = archive;
+    [generalPasteboard clearContents];
+#endif
+}
+
+- (void) restorePasteboard {
+#if TARGET_OS_OSX
+    NSPasteboard *generalPasteboard = [NSPasteboard generalPasteboard];
+    [generalPasteboard clearContents];
+    NSArray *archive = self.navigationDelegate.privatePasteboardItems;
+    [generalPasteboard restoreArchive:archive];
+#endif
+}
+
+
+- (void) presentAlertWithTitle:(NSString *)title
+                       message:(NSString *)message
+{
+    [self.navigationDelegate presentAlertWithTitle:title message:message];
+}
+
+
+- (SEBBackgroundTintStyle) backgroundTintStyle
+{
+    return [self.navigationDelegate backgroundTintStyle];
+}
+
+
+- (id) window
+{
+    return self.navigationDelegate.window;
+}
+
+- (BOOL) isAACEnabled
+{
+    return self.navigationDelegate.isAACEnabled;
+}
+
+- (void)sebWebViewDidStartLoad
+{
+//    NSHTTPCookieStorage *cookieJar = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+//    NSArray<NSHTTPCookie *> *cookies = cookieJar.cookies;
+//    [self.navigationDelegate examineCookies:cookies];
+
+    [self.navigationDelegate sebWebViewDidStartLoad];
+    if (self.isNavigationAllowed == NO && [self.browserControllerDelegate respondsToSelector:@selector(clearBackForwardList)]) {
+        [self.browserControllerDelegate clearBackForwardList];
+    }
+}
+
+
+- (void)webView:(WKWebView *)webView
+didReceiveAuthenticationChallenge:(NSURLAuthenticationChallenge *)challenge
+completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition disposition, NSURLCredential *credential))completionHandler
+{
+    if (self.navigationDelegate == nil) {
+        completionHandler(NSURLSessionAuthChallengeCancelAuthenticationChallenge, nil);
+    } else {
+        [self.navigationDelegate webView:webView didReceiveAuthenticationChallenge:challenge completionHandler:completionHandler];
+    }
+}
+
+
+- (void)sebWebViewDidFinishLoad
+{
+    [self.navigationDelegate sebWebViewDidFinishLoad];
+
+    NSURL *pageURL = self.url;
+    NSString *pageTitle = self.pageTitle;
+    if (pageTitle.length == 0) {
+        if (pageURL.pathExtension && [pageURL.pathExtension caseInsensitiveCompare:filenameExtensionPDF] == NSOrderedSame) {
+            pageTitle = pageURL.lastPathComponent;
+        } else {
+            pageTitle = @"";
+        }
+    }
+    [self.navigationDelegate setPageTitle:pageTitle];
+
+    [self.navigationDelegate setCanGoBack:self.canGoBack canGoForward:self.canGoForward];
+}
+
+
+// [R1-5] A main-frame load failure of OUR OWN content during a home session, with a
+// connectivity-class error, means the lock is stranded on a network that can't reach Blinkered
+// (offline / DNS / timeout / TLS-trust failure — the 3 Aug incident). Returns YES when the offline
+// panel was triggered (the caller then skips the generic load-error alert — the panel replaces it).
+// Ordinary in-lock site failures (a blocked third-party page) fall through to current behaviour.
+// NOTE: the cert-reject case often surfaces as −999 (cancelled), which this method never sees —
+// that trigger lives in the cert-challenge cancel path (SEBBrowserController). The exact error the
+// WKWebView emits after a cancelled challenge must be confirmed on the mitmproxy rig (plan §5.1)
+// before this code set is considered final.
+- (BOOL)blinkeredOfflinePanelForLoadError:(NSError *)error
+{
+    if (!self.isMainBrowserWebView) return NO;
+    static NSSet *connectivityCodes;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        connectivityCodes = [NSSet setWithArray:@[
+            @(NSURLErrorTimedOut),                       // −1001
+            @(NSURLErrorCannotFindHost),                 // −1003
+            @(NSURLErrorCannotConnectToHost),            // −1004
+            @(NSURLErrorNetworkConnectionLost),          // −1005
+            @(NSURLErrorDNSLookupFailed),                // −1006
+            @(NSURLErrorNotConnectedToInternet),         // −1009
+            @(NSURLErrorSecureConnectionFailed),         // −1200
+            @(NSURLErrorServerCertificateHasBadDate),    // −1201
+            @(NSURLErrorServerCertificateUntrusted),     // −1202
+            @(NSURLErrorServerCertificateHasUnknownRoot),// −1203
+            @(NSURLErrorServerCertificateNotYetValid),   // −1204
+        ]];
+    });
+    if (![error.domain isEqualToString:NSURLErrorDomain] || ![connectivityCodes containsObject:@(error.code)]) return NO;
+    // Only during a home session (identity file written at lock start) — scope to OUR lock first.
+    NSString *appSupport = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *sessionPath = [[appSupport stringByAppendingPathComponent:@"Blinkered"] stringByAppendingPathComponent:@"home_session.json"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:sessionPath]) return NO;
+    // Resolve the failing page's host from whichever key WebKit populated: the URL-OBJECT key
+    // (NSURLErrorFailingURLErrorKey — what the offline −1009 error actually carries), the string
+    // key, or the webview's current URL. On the rig (Maggie's Mac, 3 Aug) a −1009 failure carried
+    // ONLY the URL-object key and currentURL was nil during the failed provisional load, so reading
+    // just the STRING key left host empty and silently skipped the panel. Since we've already scoped
+    // to the MAIN webview of an active HOME session (our content shell — third-party sites open in
+    // separate windows, never here), only bail when we POSITIVELY identify a non-Blinkered host.
+    // An unknown/empty host still shows the panel: a stranded parent needs the way out.
+    NSURL *failingURL = [error.userInfo objectForKey:NSURLErrorFailingURLErrorKey];
+    if (![failingURL isKindOfClass:[NSURL class]]) failingURL = nil;
+    NSString *failingURLString = [error.userInfo objectForKey:NSURLErrorFailingURLStringErrorKey];
+    NSString *host = failingURL.host ?: ([NSURL URLWithString:failingURLString ?: @""].host ?: self.currentURL.host);
+    if (host.length && !([host isEqualToString:@"blinkered.com.au"] || [host hasSuffix:@".blinkered.com.au"])) return NO;
+    BOOL certKind = (error.code <= NSURLErrorSecureConnectionFailed && error.code >= NSURLErrorServerCertificateNotYetValid);
+    DDLogError(@"Blinkered: home-session content load failed with connectivity error %ld (%@) — showing offline panel", (long)error.code, certKind ? @"TLS-trust class" : @"offline class");
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"blinkeredHomeConnectivityFailed"
+                                                        object:self
+                                                      userInfo:@{ @"kind": certKind ? @"cert" : @"offline",
+                                                                  @"host": host,
+                                                                  @"code": @(error.code) }];
+    return YES;
+}
+
+- (void)sebWebViewDidFailLoadWithError:(NSError *)error
+{
+    if (error.code == -999) {
+        DDLogError(@"%s: Load Error -999: Another request initiated before the previous request was completed (%@)", __FUNCTION__, error.description);
+        return;
+    }
+    // [R1-5] Stranded home lock → native offline panel instead of the generic load-error alert.
+    if ([self blinkeredOfflinePanelForLoadError:error]) {
+        [self.navigationDelegate setLoading:NO];
+        return;
+    }
+    [self.navigationDelegate setLoading:NO];
+    // Enable back/forward buttons according to availablility for this webview
+    [self.navigationDelegate setCanGoBack:self.canGoBack canGoForward:self.canGoForward];
+
+    // Don't display the error 102 "Frame load interrupted", this can be caused by
+    // the URL filter canceling loading a blocked URL
+    if (error.code == 102) {
+        DDLogDebug(@"%s: Reported Error 102: %@", __FUNCTION__, error.description);
+        
+    // Don't display the error 204 "Plug-in handled load"
+    } else if (error.code == 204) {
+        DDLogDebug(@"%s: Reported Error 204: %@", __FUNCTION__, error.description);
+
+    } else {
+        
+        DDLogError(@"%s: Load Error: %@", __FUNCTION__, error.description);
+        
+        // Decide if of failed load should be displayed in the alert
+        // (according to current ShowURL policy settings for exam/additional tab)
+        BOOL showURL = false;
+        NSUserDefaults *preferences = [NSUserDefaults standardUserDefaults];
+        if (self.isMainBrowserWebView) {
+            if ([preferences secureIntegerForKey:@"org_safeexambrowser_SEB_browserWindowShowURL"] >= browserWindowShowURLOnlyLoadError) {
+                showURL = true;
+            }
+        } else {
+            if ([preferences secureIntegerForKey:@"org_safeexambrowser_SEB_newBrowserWindowShowURL"] >= browserWindowShowURLOnlyLoadError) {
+                showURL = true;
+            }
+        }
+        NSMutableDictionary<NSErrorUserInfoKey,id> *userInfo = error.userInfo.mutableCopy;
+        NSString *failingURLString = [error.userInfo objectForKey:NSURLErrorFailingURLStringErrorKey];
+        NSString *errorMessage = [NSString stringWithFormat:@"%@%@", error.localizedDescription, showURL ? [NSString stringWithFormat:@"\n%@", failingURLString] : @""];
+        [userInfo setValue:errorMessage forKey:NSLocalizedDescriptionKey];
+        NSError *updatedError = [[NSError alloc] initWithDomain:error.domain code:error.code userInfo:userInfo.copy];
+        error = updatedError;
+    }
+    
+    [self.navigationDelegate sebWebViewDidFailLoadWithError:error];
+}
+
+
+// Blinkered: best-effort report of a blocked MAIN-frame navigation to the server, so the parent (and we,
+// while tuning the allow-list) get notified that a page didn't load. Deduped per host for the process
+// lifetime so it never spams; identity comes from home_session.json (written at lock time). Mirrors the
+// existing security-event POST pattern.
+- (void)blinkeredReportBlockedNavigation:(NSURL *)blockedURL linkActivated:(BOOL)linkActivated source:(NSString *)source
+{
+    NSString *host = blockedURL.host;
+    if (host.length == 0) return;
+    static NSMutableSet *reportedHosts;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ reportedHosts = [NSMutableSet new]; });
+    @synchronized (reportedHosts) {
+        if ([reportedHosts containsObject:host]) return;
+        [reportedHosts addObject:host];
+    }
+    NSString *appSupport = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [[appSupport stringByAppendingPathComponent:@"Blinkered"] stringByAppendingPathComponent:@"home_session.json"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data) return;
+    NSDictionary *info = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![info isKindOfClass:[NSDictionary class]]) return;
+    NSString *base = info[@"base"], *deviceId = info[@"id"], *token = info[@"token"];
+    if (base.length == 0 || deviceId.length == 0 || token.length == 0) return;
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/api/home/devices/%@/blocked-nav", base, deviceId]];
+    if (!url) return;
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
+    req.HTTPMethod = @"POST";
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    // linkActivated: the child actively clicked a link to leave (an escape — server keeps it blocked).
+    // source: the allowed site they were on (so the server can auto-classify auth/redirect flows).
+    NSDictionary *payload = @{ @"token": token,
+                              @"url": blockedURL.absoluteString ?: @"",
+                              @"linkActivated": @(linkActivated),
+                              @"source": source ?: @"" };
+    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+    if (req.HTTPBody) {
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req] resume];
+        DDLogInfo(@"Blinkered: reported blocked page to server (%@, click=%d)", host, linkActivated);
+    }
+}
+
+
+- (SEBNavigationAction *)decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction
+                                                      newTab:(BOOL)newTab
+                                           configuration:(WKWebViewConfiguration *)configuration
+                                        downloadFilename:(nullable NSString *)downloadFilename
+{
+    NSURLRequest *request = navigationAction.request;
+    NSURL *url = request.URL;
+    DDLogVerbose(@"[SEBAbstractWebView decidePolicyForNavigationAction: newTab: %hhd configuration:%@ downloadFilename:%@]: request = %@, URL = %@", newTab, configuration, downloadFilename, request, url);
+    WKNavigationType navigationType = navigationAction.navigationType;
+    NSString *httpMethod = request.HTTPMethod;
+    //    NSDictionary<NSString *,NSString *> *allHTTPHeaderFields = request.allHTTPHeaderFields;
+    DDLogVerbose(@"Navigation type for URL %@: %ld", url, (long)navigationType);
+    DDLogVerbose(@"HTTP method for URL %@: %@", url, httpMethod);
+    //    DDLogVerbose(@"All HTTP header fields for URL %@: %@", url, allHTTPHeaderFields);
+    
+    NSUserDefaults *preferences = [NSUserDefaults standardUserDefaults];
+    
+    NSURL *originalURL = url;
+    SEBNavigationAction *newNavigationAction = [SEBNavigationAction new];
+    newNavigationAction.policy = SEBNavigationActionPolicyCancel;
+    
+    // This is currently used for SEB Server handshake after logging in to Moodle
+    if (navigationType == WKNavigationTypeFormSubmitted) {
+        [self.navigationDelegate shouldStartLoadFormSubmittedURL:url];
+    }
+    
+    // Check if quit URL has been clicked (regardless of current URL Filter)
+    if ([[[originalURL.absoluteString stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]] lowercaseString] isEqualToString:quitURLTrimmed]) {
+        [[NSNotificationCenter defaultCenter]
+         postNotificationName:@"quitLinkDetected" object:self];
+        return newNavigationAction;
+    }
+
+    // Intercept /seb-setquit?h=<64-char-hash>&to=<url> to persist the per-class quit password.
+    // We write the hash to a plain file and then ALLOW the navigation so the server can redirect
+    // the student to the content page.
+    if ([originalURL.path isEqualToString:@"/seb-setquit"]) {
+        NSString *appSupport = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *dir = [appSupport stringByAppendingPathComponent:@"Blinkered"];
+        // [R2-2] Entering a CLASS session — clear any stale home_session.json. It's removed only on
+        // a clean native home-quit, so a remote unlock / crash / watchdog kill of a prior home lock
+        // leaves it behind; the home-only gates (offline panel, setQuitPassword refusal) key on this
+        // file's existence, so a leftover would fire home behaviour inside an exam.
+        [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:@"home_session.json"] error:nil];
+        NSURLComponents *components = [NSURLComponents componentsWithURL:originalURL resolvingAgainstBaseURL:NO];
+        NSString *hash = nil;
+        for (NSURLQueryItem *item in components.queryItems) {
+            if ([item.name isEqualToString:@"h"]) { hash = item.value; break; }
+        }
+        if ([hash isKindOfClass:[NSString class]] && hash.length == 64) {
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *filePath = [dir stringByAppendingPathComponent:@"class_quit_hash.txt"];
+            [hash writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            DDLogInfo(@"Blinkered: quit hash written to file");
+        }
+        // Allow the navigation — server will redirect to the content page.
+        newNavigationAction.policy = SEBNavigationActionPolicyAllow;
+        return newNavigationAction;
+    }
+
+    // Intercept /seb-setsession?code=...&token=...&base=...&h=...&to=<url>
+    // Writes class_session.json (for native-quit server notification) and class_quit_hash.txt,
+    // then allows navigation so the server redirects to the content page.
+    if ([originalURL.path isEqualToString:@"/seb-setsession"]) {
+        NSURLComponents *components = [NSURLComponents componentsWithURL:originalURL resolvingAgainstBaseURL:NO];
+        NSString *code = nil, *token = nil, *base = nil, *hash = nil;
+        for (NSURLQueryItem *item in components.queryItems) {
+            if ([item.name isEqualToString:@"code"])  code  = item.value;
+            if ([item.name isEqualToString:@"token"]) token = item.value;
+            if ([item.name isEqualToString:@"base"])  base  = item.value;
+            if ([item.name isEqualToString:@"h"])     hash  = item.value;
+        }
+        NSString *appSupport = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *dir = [appSupport stringByAppendingPathComponent:@"Blinkered"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        // [R2-2] Entering a CLASS session — clear any stale home_session.json (see /seb-setquit).
+        [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:@"home_session.json"] error:nil];
+        // Write class_session.json so SEBController can call /api/class/:code/native-quit
+        if (code.length > 0 && token.length > 0 && base.length > 0) {
+            NSDictionary *sessionInfo = @{@"code": code, @"token": token, @"base": base};
+            NSData *data = [NSJSONSerialization dataWithJSONObject:sessionInfo options:0 error:nil];
+            if (data) {
+                [data writeToFile:[dir stringByAppendingPathComponent:@"class_session.json"] atomically:YES];
+                DDLogInfo(@"Blinkered: class session info written (code=%@)", code);
+            }
+        }
+        // Write or clear class_quit_hash.txt for the native password dialog.
+        NSString *hashFilePath = [dir stringByAppendingPathComponent:@"class_quit_hash.txt"];
+        if ([hash isKindOfClass:[NSString class]] && hash.length == 64) {
+            [hash writeToFile:hashFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            DDLogInfo(@"Blinkered: quit hash written via seb-setsession");
+        } else {
+            // No password required for this session — remove any stale hash from a previous session
+            // so the native quit dialog is not shown erroneously.
+            [[NSFileManager defaultManager] removeItemAtPath:hashFilePath error:nil];
+            DDLogInfo(@"Blinkered: quit hash cleared (no password required for this session)");
+        }
+        newNavigationAction.policy = SEBNavigationActionPolicyAllow;
+        return newNavigationAction;
+    }
+
+    // Intercept /seb-sethomesession?id=...&token=...&base=...&to=<content-url>
+    // Writes home_session.json (for native-quit server notification) and clears any
+    // stale class_quit_hash.txt so a prior class password cannot unlock a home session.
+    if ([originalURL.path isEqualToString:@"/seb-sethomesession"]) {
+        NSURLComponents *components = [NSURLComponents componentsWithURL:originalURL resolvingAgainstBaseURL:NO];
+        NSString *deviceId = nil, *token = nil, *base = nil, *sessionId = nil, *toURL = nil;
+        for (NSURLQueryItem *item in components.queryItems) {
+            if ([item.name isEqualToString:@"id"])    deviceId  = item.value;
+            if ([item.name isEqualToString:@"token"]) token     = item.value;
+            if ([item.name isEqualToString:@"base"])  base      = item.value;
+            if ([item.name isEqualToString:@"sid"])   sessionId = item.value;
+            if ([item.name isEqualToString:@"to"])    toURL     = item.value;
+        }
+        // [R1-3] The lock's session UUID must land in home_session.json — the offline parent-exit
+        // marker matches the agent's persisted lock on it. Newer servers send &sid= directly;
+        // fall back to extracting it from the content URL's own &sid= (it has always been there).
+        if (sessionId.length == 0 && toURL.length > 0) {
+            NSURLComponents *toComponents = [NSURLComponents componentsWithString:toURL];
+            for (NSURLQueryItem *item in toComponents.queryItems) {
+                if ([item.name isEqualToString:@"sid"]) { sessionId = item.value; break; }
+            }
+        }
+        NSString *appSupport = [NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *dir = [appSupport stringByAppendingPathComponent:@"Blinkered"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        if (deviceId.length > 0 && token.length > 0 && base.length > 0) {
+            NSMutableDictionary *sessionInfo = [@{@"id": deviceId, @"token": token, @"base": base} mutableCopy];
+            if (sessionId.length > 0) sessionInfo[@"sessionId"] = sessionId;
+            NSData *data = [NSJSONSerialization dataWithJSONObject:sessionInfo options:0 error:nil];
+            if (data) {
+                [data writeToFile:[dir stringByAppendingPathComponent:@"home_session.json"] atomically:YES];
+                DDLogInfo(@"Blinkered: home session info written (device=%@, sessionId=%@)", deviceId, sessionId.length ? sessionId : @"<none>");
+            }
+        }
+        // Remove stale class_quit_hash.txt — home sessions must not inherit a prior class password.
+        [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:@"class_quit_hash.txt"] error:nil];
+        DDLogInfo(@"Blinkered: class quit hash cleared for home session");
+        newNavigationAction.policy = SEBNavigationActionPolicyAllow;
+        return newNavigationAction;
+    }
+
+    if (urlFilter.enableURLFilter && ![self.navigationDelegate downloadingInTemporaryWebView]) {
+        URLFilterRuleActions filterActionResponse = [urlFilter testURLAllowed:originalURL];
+        if (filterActionResponse != URLFilterActionAllow) {
+            // Blinkered: report only MAIN-frame page blocks to the server — a page the kid actually
+            // tried to open that didn't load — NOT blocked ad/tracker iframes (targetFrame present and
+            // not the main frame), which would be noise. targetFrame==nil = a new-window/top-level nav.
+            BOOL isMainFrameNav = (navigationAction.targetFrame == nil || navigationAction.targetFrame.isMainFrame);
+            if (isMainFrameNav) {
+                // linkActivated = the child actively clicked a link to leave (escape → stays blocked);
+                // source = the allowed page they were on (lets the server auto-classify auth/redirects).
+                BOOL linkActivated = (navigationType == WKNavigationTypeLinkActivated);
+                // CRASH GUARD (macOS 26 / new WebKit): for a NEW-WINDOW navigation — window.open(),
+                // which is exactly how the research lane opens its browser — targetFrame is nil and
+                // navigationAction.sourceFrame's getter can crash with "CFRetain() called with NULL"
+                // (EXC_BREAKPOINT), because the source frame is null. That crash-LOOPS a locked device
+                // (every relaunch restores the same nav and re-crashes). Only read sourceFrame when
+                // there is a target frame (an in-page / main-frame nav, where it is populated); for a
+                // new-window nav fall back to the current page URL. macOS 15 never nulled it, so it only
+                // surfaced once a test Mac was on Tahoe.
+                NSString *source;
+                if (navigationAction.targetFrame != nil) {
+                    source = navigationAction.sourceFrame.request.URL.absoluteString ?: @"";
+                } else {
+                    source = self.currentURL.absoluteString ?: @"";
+                }
+                [self blinkeredReportBlockedNavigation:originalURL linkActivated:linkActivated source:source];
+            }
+            /// Content is not allowed: Show teach URL alert if activated or just indicate URL is blocked filterActionResponse == URLFilterActionBlock ||
+            // We show the URL blocked overlay message only if a link was actively tapped by the user
+            if ((navigationType == WKNavigationTypeLinkActivated || urlFilter.learningMode)) {
+                if ([self.navigationDelegate showURLFilterAlertForRequest:request forContentFilter:NO filterResponse:filterActionResponse] == NO) {
+                    /// User didn't allow the content, don't load it
+                    DDLogWarn(@"A clicked link was blocked by the URL filter");
+                    DDLogDebug(@"This clicked link was blocked by the URL filter: %@", originalURL.absoluteString);
+                    return newNavigationAction;
+                }
+            } else {
+                DDLogDebug(@"This resource was blocked by the URL filter: %@", originalURL.absoluteString);
+                return newNavigationAction;
+            }
+        }
+    }
+    
+    NSString *fileExtension = [url pathExtension];
+    
+    if (newTab) {
+        newBrowserWindowPolicies newBrowserWindowPolicy = [preferences secureIntegerForKey:@"org_safeexambrowser_SEB_newBrowserWindowByLinkPolicy"];
+        
+        // First check if links requesting to be opened in a new windows are generally blocked
+        if (newBrowserWindowPolicy != getGenerallyBlocked) {
+            // load link only if it's on the same host like the one of the current page
+            if (![preferences secureBoolForKey:@"org_safeexambrowser_SEB_newBrowserWindowByLinkBlockForeign"] ||
+                [self.navigationDelegate.currentMainHost isEqualToString:request.URL.host]) {
+                if (newBrowserWindowPolicy == openInNewWindow) {
+                    // Open in new tab
+                    DDLogInfo(@"Open new window/tab URL in new window");
+                    newNavigationAction.openedWebView = [self.navigationDelegate openNewTabWithURL:url configuration:(WKWebViewConfiguration *)configuration];
+                    if (configuration) {
+                        // Special case of window opened with Javascript .open() in a modern WebView (WKWebView)
+                        newNavigationAction.policy = SEBNavigationActionPolicyJSOpen;
+                        return newNavigationAction;
+                    }
+                    return newNavigationAction;
+                }
+                if (newBrowserWindowPolicy == openInSameWindow) {
+                    // Load URL request in existing tab
+                    DDLogInfo(@"Open new window/tab URL in same window (selected in current settings)");
+                    if (configuration) {
+                        // Special case of window opened with Javascript .open() in a modern WebView (WKWebView)
+                        newNavigationAction.policy = SEBNavigationActionPolicyJSOpen;
+                    }
+                    [self loadURL:url];
+                    //                    newNavigationAction.openedWebView = self;
+                    return newNavigationAction;
+                }
+            }
+        }
+        // Opening links in new windows is not allowed by current policies
+        // We show the URL blocked overlay message only if a link was actively tapped by the user
+        if (navigationType == WKNavigationTypeLinkActivated) {
+            [self.navigationDelegate showURLFilterAlertForRequest:request forContentFilter:NO filterResponse:SEBURLFilterAlertBlock];
+        }
+        DDLogInfo(@"Opening new window/tab URL generally blocked in current settings");
+        return newNavigationAction;
+    }
+    BOOL WKDownloadSupported = NO;
+    if (@available(macOS 11.3, iOS 14.5, *)) {
+        WKDownloadSupported = YES;
+    }
+    if (![[self.browserControllerDelegate class] isEqual:SEBAbstractModernWebView.class]) {
+        WKDownloadSupported = NO;
+    }
+    if (!WKDownloadSupported) {
+        if ([url.scheme isEqualToString:@"data"]) {
+            NSString *urlResourceSpecifier = [[url resourceSpecifier] stringByRemovingPercentEncoding];
+            DDLogDebug(@"resourceSpecifier of data: URL is %@", urlResourceSpecifier);
+            NSRange mediaTypeRange = [urlResourceSpecifier rangeOfString:@","];
+            if (mediaTypeRange.location != NSNotFound && mediaTypeRange.location > 0 && urlResourceSpecifier.length > mediaTypeRange.location) {
+                NSString *mediaType = [[urlResourceSpecifier substringToIndex:mediaTypeRange.location] lowercaseString];
+                NSArray *mediaTypeParameters = [mediaType componentsSeparatedByString:@";"];
+                if ([mediaTypeParameters indexOfObject:SEBConfigMIMEType] != NSNotFound) {
+                    if ([preferences secureBoolForKey:@"org_safeexambrowser_SEB_downloadAndOpenSebConfig"] == NO) {
+                        [self.navigationDelegate showAlertNotAllowedDownloadingAndOpeningSebConfig:YES];
+                    } else {
+                        NSString *sebConfigString = [urlResourceSpecifier substringFromIndex:mediaTypeRange.location+1];
+                        NSData *sebConfigData;
+                        if ([mediaTypeParameters indexOfObject:@"base64"] == NSNotFound) {
+                            sebConfigData = [sebConfigString dataUsingEncoding:NSUTF8StringEncoding];
+                        } else {
+                            sebConfigData = [[NSData alloc] initWithBase64EncodedString:sebConfigString options:NSDataBase64DecodingIgnoreUnknownCharacters];
+                        }
+                        [self.navigationDelegate openSEBConfigFromData:sebConfigData];
+                    }
+                } else if (self.allowDownloads) {
+                    NSString *fileDataString = [urlResourceSpecifier substringFromIndex:mediaTypeRange.location+1];
+                    NSData *fileData;
+                    if ([mediaTypeParameters indexOfObject:@"base64"] == NSNotFound) {
+                        fileData = [fileDataString dataUsingEncoding:NSUTF8StringEncoding];
+                    } else {
+                        fileData = [[NSData alloc] initWithBase64EncodedString:fileDataString options:NSDataBase64DecodingIgnoreUnknownCharacters];
+                    }
+                    NSString *filename = [self saveData:fileData downloadFilename:downloadFilename];
+                    if (filename) {
+                        DDLogInfo(@"Successfully saved website generated data: %@", url);
+                        [self.navigationDelegate fileDownloadedSuccessfully:filename];
+                    } else {
+                        DDLogError(@"Failed to save website generated data: %@", url);
+                        [self.navigationDelegate presentAlertWithTitle:NSLocalizedString(@"Download Failed", @"") message:[NSString stringWithFormat:NSLocalizedString(@"Could not save downloaded data, probably a wrong download directory was used in %@ settings.", @""), SEBShortAppName]];
+                    }
+                } else if (!self.allowDownloads && navigationType == WKNavigationTypeLinkActivated) {
+                    [self.navigationDelegate showAlertNotAllowedDownUploading:NO];
+                }
+            }
+            newNavigationAction.policy = SEBNavigationActionPolicyCancel;
+            return newNavigationAction;
+        }
+    }
+    // Check if this is a seb:// or sebs:// link or a .seb file link
+    if (((url.scheme && [url.scheme caseInsensitiveCompare:SEBProtocolScheme] == NSOrderedSame) ||
+        (url.scheme && [url.scheme caseInsensitiveCompare:SEBSSecureProtocolScheme] == NSOrderedSame) ||
+        (fileExtension && [fileExtension caseInsensitiveCompare:SEBFileExtension] == NSOrderedSame))) {
+        if ([preferences secureBoolForKey:@"org_safeexambrowser_SEB_downloadAndOpenSebConfig"]) {
+            // If the scheme is seb(s):// or the file extension .seb,
+            // we (conditionally) download and open the linked .seb file
+            if (!self.navigationDelegate.downloadingInTemporaryWebView) {
+                [self.navigationDelegate conditionallyDownloadAndOpenSEBConfigFromURL:url];
+                return newNavigationAction;
+            }
+        } else {
+            [self.navigationDelegate showAlertNotAllowedDownloadingAndOpeningSebConfig:YES];
+            return newNavigationAction;
+        }
+    }
+
+    self.navigationDelegate.currentURL = url;
+    self.navigationDelegate.currentMainHost = url.host;
+    newNavigationAction.policy = SEBNavigationResponsePolicyAllow;
+    return newNavigationAction;
+}
+
+
+- (NSString *)saveData:(NSData *)data downloadFilename:(nullable NSString *)downloadFilename
+{
+    // Get the path to the App's Documents directory
+    NSString *filename;
+    if (downloadFilename.length > 0) {
+        filename = downloadFilename;
+    } else {
+        filename = NSLocalizedString(@"Untitled", @"untitled filename");
+        NSDate *time = [NSDate date];
+        NSDateFormatter* dateFormatter = [NSDateFormatter new];
+        dateFormatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"en_US"];
+        [dateFormatter setDateFormat:@"yyyy-MM-dd_hh-mm-ss"];
+        NSString *timeString = [dateFormatter stringFromDate:time];
+        filename = [NSString stringWithFormat:@"%@_%@", filename, timeString];
+    }
+    
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    int fileIndex = 1;
+    NSURL *directory = self.downloadPathURL;
+    NSString* filenameWithoutExtension = [filename stringByDeletingPathExtension];
+    NSString* fileExtension = [filename pathExtension];
+
+    while ([fileManager fileExistsAtPath:[directory URLByAppendingPathComponent:filename isDirectory:NO].path]) {
+        filename = [NSString stringWithFormat:@"%@-%d.%@", filenameWithoutExtension, fileIndex, fileExtension];
+        fileIndex++;
+    }
+    BOOL success = [fileManager createFileAtPath:[directory URLByAppendingPathComponent:filename isDirectory:NO].path contents:data attributes:nil];
+    if (success) {
+        filename = [directory URLByAppendingPathComponent:filename isDirectory:NO].path;
+        DDLogInfo(@"%s at file path: %@", __FUNCTION__, filename);
+        return filename;
+    } else {
+        return nil;
+    }
+}
+
+
+- (void)sebWebViewDidUpdateTitle:(nullable NSString *)title
+{
+    if ([self.navigationDelegate respondsToSelector:@selector(sebWebViewDidUpdateTitle:)]) {
+        [self.navigationDelegate sebWebViewDidUpdateTitle:title];
+    }
+}
+
+
+- (void)sebWebViewDidUpdateProgress:(double)progress
+{
+    if ([self.navigationDelegate respondsToSelector:@selector(sebWebViewDidUpdateProgress:)]) {
+        [self.navigationDelegate sebWebViewDidUpdateProgress:progress];
+    }
+}
+
+
+- (SEBNavigationResponsePolicy)decidePolicyForMIMEType:(NSString*)mimeType
+                                                   url:(NSURL *)url
+                                       canShowMIMEType:(BOOL)canShowMIMEType
+                                        isForMainFrame:(BOOL)isForMainFrame
+                                     suggestedFilename:(NSString *)suggestedFilename
+                                               cookies:(NSArray <NSHTTPCookie *>*)cookies
+{
+    DDLogVerbose(@"decidePolicyForMIMEType: %@, URL: %@, canShowMIMEType: %d, isForMainFrame: %d, suggestedFilename %@", mimeType, url.absoluteString, canShowMIMEType, isForMainFrame, suggestedFilename);
+    
+    [self.navigationDelegate examineCookies:cookies forURL:url];
+    
+    if ((mimeType && [mimeType caseInsensitiveCompare:SEBConfigMIMEType] == NSOrderedSame) ||
+        (mimeType && [mimeType caseInsensitiveCompare:SEBUnencryptedConfigMIMEType] == NSOrderedSame) ||
+        (url.pathExtension && [url.pathExtension caseInsensitiveCompare:SEBFileExtension] == NSOrderedSame)) {
+        // If MIME-Type or extension of the file indicates a .seb file, we (conditionally) download and open it
+        NSURL *originalURL = self.originalURL;
+        self.downloadingSEBConfig = YES;
+        [self.navigationDelegate downloadSEBConfigFileFromURL:url originalURL:originalURL cookies:cookies];
+        return SEBNavigationActionPolicyCancel;
+    }
+
+    // Check for PDF file and according to settings either download or display it inline in the SEB browser
+    if (!((mimeType && [mimeType caseInsensitiveCompare:mimeTypePDF] == NSOrderedSame) && self.navigationDelegate.allowDownloads && _downloadPDFFiles)) {
+        // MIME type isn't PDF or downloading of PDFs isn't allowed
+        if (canShowMIMEType) {
+            return SEBNavigationActionPolicyAllow;
+        }
+    }
+    // If MIME type cannot be displayed by the WebView, then we download it
+    DDLogInfo(@"MIME type to download is %@", mimeType);
+    return SEBNavigationActionPolicyDownload;
+}
+
+
+- (void)webViewDidClose:(WKWebView *)webView
+{
+    [self.navigationDelegate closeWebView:self];
+}
+
+
+- (void)webView:(WKWebView *)webView
+runJavaScriptAlertPanelWithMessage:(NSString *)message
+initiatedByFrame:(WKFrameInfo *)frame
+completionHandler:(void (^)(void))completionHandler
+{
+    [self.navigationDelegate webView:webView runJavaScriptAlertPanelWithMessage:message initiatedByFrame:frame completionHandler:completionHandler];
+}
+
+- (void)pageTitle:(NSString *)pageTitle
+runJavaScriptAlertPanelWithMessage:(NSString *)message
+{
+    [self.navigationDelegate pageTitle:pageTitle runJavaScriptAlertPanelWithMessage:message];
+}
+
+- (void)webView:(WKWebView *)webView
+runJavaScriptConfirmPanelWithMessage:(NSString *)message
+initiatedByFrame:(WKFrameInfo *)frame
+completionHandler:(void (^)(BOOL result))completionHandler
+{
+    [self.navigationDelegate webView:webView runJavaScriptConfirmPanelWithMessage:message initiatedByFrame:frame completionHandler:completionHandler];
+}
+
+- (BOOL)pageTitle:(NSString *)pageTitle
+runJavaScriptConfirmPanelWithMessage:(NSString *)message
+{
+    return [self.navigationDelegate pageTitle:pageTitle runJavaScriptConfirmPanelWithMessage:message];
+}
+
+- (void)webView:(WKWebView *)webView
+runJavaScriptTextInputPanelWithPrompt:(NSString *)prompt
+    defaultText:(nullable NSString *)defaultText
+initiatedByFrame:(WKFrameInfo *)frame
+completionHandler:(void (^)(NSString *result))completionHandler
+{
+    [self.navigationDelegate webView:webView runJavaScriptTextInputPanelWithPrompt:prompt defaultText:defaultText initiatedByFrame:frame completionHandler:completionHandler];
+}
+
+- (NSString *)pageTitle:(NSString *)pageTitle
+runJavaScriptTextInputPanelWithPrompt:(NSString *)prompt
+          defaultText:(NSString *)defaultText
+{
+    return [self.navigationDelegate pageTitle:pageTitle runJavaScriptTextInputPanelWithPrompt:prompt defaultText:defaultText];
+}
+
+- (void)webView:(WKWebView *)webView
+runOpenPanelWithParameters:(id)parameters
+initiatedByFrame:(WKFrameInfo *)frame
+completionHandler:(void (^)(NSArray<NSURL *> *URLs))completionHandler
+{
+    [self.navigationDelegate webView:webView runOpenPanelWithParameters:parameters initiatedByFrame:frame completionHandler:completionHandler];
+}
+
+
+- (BOOL) showURLFilterAlertForRequest:(NSURLRequest *)request
+                     forContentFilter:(BOOL)contentFilter
+                       filterResponse:(URLFilterRuleActions)filterResponse
+{
+    return [self.navigationDelegate showURLFilterAlertForRequest:request forContentFilter:contentFilter filterResponse:filterResponse];
+}
+
+
+- (NSURL *) downloadPathURL
+{
+    return self.navigationDelegate.downloadPathURL;
+}
+
+- (void) downloadFileFromURL:(NSURL *)url filename:(NSString *)filename cookies:(NSArray <NSHTTPCookie *>*)cookies
+{
+    [self.navigationDelegate downloadFileFromURL:url filename:filename cookies:cookies];
+}
+
+- (void) fileDownloadedSuccessfully:(NSString *)path
+{
+    [self.navigationDelegate fileDownloadedSuccessfully:path];
+}
+
+
+- (BOOL) downloadingInTemporaryWebView
+{
+    return [self.navigationDelegate downloadingInTemporaryWebView];
+}
+
+@end
+
+
+@implementation SEBWKNavigationAction
+
+- (void)setNavigationType:(WKNavigationType)navigationType
+{
+    _writableNavigationType = navigationType;
+}
+
+- (WKNavigationType)navigationType
+{
+    if (_writableNavigationType) {
+        return _writableNavigationType;
+    } else {
+        return super.navigationType;
+    }
+}
+
+- (void)setRequest:(NSURLRequest *)request
+{
+    _writableRequest = request;
+}
+
+- (NSURLRequest *)request
+{
+    if (_writableRequest) {
+        return _writableRequest;
+    } else {
+        return super.request;
+    }
+}
+
+@end
+
+
+@implementation SEBNavigationAction
+
+@end
