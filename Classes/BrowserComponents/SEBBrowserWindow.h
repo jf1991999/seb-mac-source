@@ -1,0 +1,141 @@
+//
+//  BrowserWindow.h
+//  Safe Exam Browser
+//
+//  Created by Daniel R. Schneider on 06.12.10.
+//  Copyright (c) 2010-2025 Daniel R. Schneider, ETH Zurich, IT Services,
+//  based on the original idea of Safe Exam Browser 
+//  by Stefan Schneider, University of Giessen
+//  Project concept: Thomas Piendl, Daniel R. Schneider, Damian Buechel, 
+//  Dirk Bauer, Kai Reuter, Tobias Halbherr, Karsten Burger, Marco Lehre, 
+//  Brigitte Schmucki, Oliver Rahs. French localization: Nicolas Dunand
+//
+//  ``The contents of this file are subject to the Mozilla Public License
+//  Version 2.0 (the "License"); you may not use this file except in
+//  compliance with the License. You may obtain a copy of the License at
+//  http://www.mozilla.org/MPL/
+//  
+//  Software distributed under the License is distributed on an "AS IS"
+//  basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See the
+//  License for the specific language governing rights and limitations
+//  under the License.
+//  
+//  The Original Code is Safe Exam Browser for Mac OS X.
+//  
+//  The Initial Developer of the Original Code is Daniel R. Schneider.
+//  Portions created by Daniel R. Schneider are Copyright 
+//  (c) 2010-2025 Daniel R. Schneider, ETH Zurich, IT Services,
+//  based on the original idea of Safe Exam Browser
+//  by Stefan Schneider, University of Giessen. All Rights Reserved.
+//  
+//  Contributor(s): ______________________________________.
+//
+
+// Browser window class, also containing all the web view delegates
+
+#import <Cocoa/Cocoa.h>
+#import <WebKit/WebKit.h>
+
+#import "SEBBrowserWindowController.h"
+#import "SEBOSXWebViewController.h"
+#import "SEBAbstractWebView.h"
+#import "SEBEncryptedUserDefaultsController.h"
+#import "SEBOSXBrowserController.h"
+#import "SEBTextField.h"
+
+NS_ASSUME_NONNULL_BEGIN
+
+@class SEBOSXWebViewController;
+@class SEBAbstractWebView;
+@class SEBOSXBrowserController;
+
+
+@interface SEBBrowserWindow : NSWindow <NSWindowDelegate, NSTextViewDelegate, SEBAbstractBrowserControllerDelegate, SEBAbstractWebViewNavigationDelegate>
+
+@property (strong, nonatomic) id<SEBAbstractBrowserControllerDelegate> browserControllerDelegate;
+@property (weak) SEBOSXBrowserController *browserController;
+@property (nonatomic, strong) SEBOSXWebViewController<SEBAbstractBrowserControllerDelegate> *visibleWebViewController;
+@property (nullable, strong, nonatomic) SEBAbstractWebView *webView;
+@property (nullable, strong, nonatomic) NSURL *currentURL;
+// The URL this window was originally opened with (before any login redirect), used
+// to match a 🪟 site tab back to ITS window even after it navigates cross-domain.
+@property (nullable, copy, nonatomic) NSString *blinkeredOriginalURLString;
+// The windowNumber of the window whose page opened THIS window (window.open / target=_blank),
+// or 0 for a tab-opened window. Lets the home page group a document window (e.g. a Word file
+// opened from the OneDrive list — possibly cross-host) under its opener's site tab.
+@property (nonatomic) NSInteger blinkeredOpenerWindowNumber;
+@property (strong, nonatomic) NSString *javaScriptFunctions;
+@property (readwrite) BOOL isMainBrowserWindow;
+@property (readonly) BOOL blinkeredContentHeld;   // P1 Bug-A: window is deliberately held black until first paint
+@property (strong) IBOutlet NSWindow *URLFilterAlert;
+@property (strong) IBOutlet NSWindow *customAlert;
+@property (weak) IBOutlet SEBTextField *customAlertText;
+@property (weak) IBOutlet SEBTextField *URLFilterAlertText;
+@property (strong) IBOutlet NSURL *URLFilterAlertURL;
+@property (strong) NSString *filterExpression;
+@property (weak) IBOutlet NSMatrix *filterPatternMatrix;
+@property (strong) IBOutlet NSTextView *filterExpressionField;
+@property BOOL isFullScreen;
+@property BOOL isPanel;
+@property (weak) IBOutlet NSButton *domainPatternButton;
+@property (weak) IBOutlet NSButton *hostPatternButton;
+@property (weak) IBOutlet NSButton *hostPathPatternButton;
+@property (weak) IBOutlet NSButton *directoryPatternButton;
+@property (strong) NSView *progressIndicatorHolder;
+@property (strong) NSView *filterMessageHolder;
+@property (strong) NSPanel *filterMessageHUD;
+
+// ── Blinkered split screen ───────────────────────────────────────────────────────────────
+// Which half of a 50/50 split this site window occupies, or None. Lives on the WINDOW, not
+// in a pair keyed by id: a recycled windowNumber can then never corrupt it, and there is no
+// pair identity to reconcile. Read by -setCalculatedFrameOnScreen:… — see SPLIT_SCREEN_PLAN.md R9.
+typedef NS_ENUM(NSInteger, SEBBlinkeredSplitRole) {
+    SEBBlinkeredSplitRoleNone  = 0,
+    SEBBlinkeredSplitRoleLeft  = 1,
+    SEBBlinkeredSplitRoleRight = 2,
+};
+
+@property (readwrite) SEBBlinkeredSplitRole blinkeredSplitRole;
+
+- (void)addConstraintsToWebView:(NSView*) nativeWebView;
+
+- (void) performFindPanelAction:(id)sender;
+- (void) searchText;
+- (void) searchTextNext;
+- (void) searchTextPrevious;
+
+@property (readwrite) BOOL toolbarWasHidden;
+- (void) conditionallyDisplayToolbar;
+
+// Launch cleanup #4/#5: keep the window black (content view hidden) until the
+// first page has painted, so the launch shows covers -> content instead of a
+// blank white browser rectangle. Reveal is triggered by page finish, page
+// failure, or a safety-net timer.
+- (void) blinkeredHoldContentUntilFirstPaint;
+/// C4: drop the empty-content backdrop if real content is present but the commit/finish removal
+/// path never fired. Observation only — it never installs, and never drops on elapsed time.
+- (void) blinkeredRecheckEmptyContentBackdrop;
+- (void) blinkeredRevealContent;
+
+// Proposal B (MAC_WAKE_EDGE_RECOVERY_PLAN.md §2): branded native backdrop for HOME locks.
+// A paint failure used to show the window's own void black — indistinguishable from a bricked
+// Mac. These are the shared, WebKit-free brand primitives used by the hold overlay here and by
+// the cover-window creation path in SEBController (fillScreensWithCoveringWindows:).
++ (NSColor *) blinkeredBrandBackdropColor;
++ (void) blinkeredAddBrandBackdropContentToView:(NSView *)view;
++ (BOOL) blinkeredIsHomeLockSession;
+
+- (void) setCalculatedFrame;
+- (void) setCalculatedFrameOnScreen:(NSScreen *)screen;
+- (void) setCalculatedFrameOnScreen:(NSScreen *)screen mainBrowserWindow:(BOOL)mainBrowserWindow temporaryWindow:(BOOL)temporaryWindow;
+
+- (void) startProgressIndicatorAnimation;
+- (void) stopProgressIndicatorAnimation;
+- (void) activateInitialFirstResponder;
+- (void) makeContentFirstResponder;
+- (void) goToDock;
+
+
+@end
+
+NS_ASSUME_NONNULL_END
