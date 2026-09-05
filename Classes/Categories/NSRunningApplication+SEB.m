@@ -1,0 +1,137 @@
+//
+//  NSRunningApplication+SEB
+//  SafeExamBrowser
+//
+//  Created by Daniel R. Schneider on 15.10.16.
+//  Copyright (c) 2010-2025 Daniel R. Schneider, ETH Zurich, IT Services,
+//  based on the original idea of Safe Exam Browser
+//  by Stefan Schneider, University of Giessen
+//  Project concept: Thomas Piendl, Daniel R. Schneider,
+//  Dirk Bauer, Kai Reuter, Tobias Halbherr, Karsten Burger, Marco Lehre,
+//  Brigitte Schmucki, Oliver Rahs. French localization: Nicolas Dunand
+//
+//  ``The contents of this file are subject to the Mozilla Public License
+//  Version 2.0 (the "License"); you may not use this file except in
+//  compliance with the License. You may obtain a copy of the License at
+//  http://www.mozilla.org/MPL/
+//
+//  Software distributed under the License is distributed on an "AS IS"
+//  basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See the
+//  License for the specific language governing rights and limitations
+//  under the License.
+//
+//  The Original Code is Safe Exam Browser for Mac OS X.
+//
+//  The Initial Developer of the Original Code is Daniel R. Schneider.
+//  Portions created by Daniel R. Schneider are Copyright
+//  (c) 2010-2025 Daniel R. Schneider, ETH Zurich, IT Services,
+//  based on the original idea of Safe Exam Browser
+//  by Stefan Schneider, University of Giessen. All Rights Reserved.
+//
+//  Contributor(s): ______________________________________.
+//
+
+#import "NSRunningApplication+SEB.h"
+
+
+@implementation NSRunningApplication (SEB)
+
+
++ (BOOL)killApplicationWithBundleIdentifier:(NSString *)bundleID
+{
+    NSArray *runningApplicationInstances = [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID];
+    BOOL success = NO;
+    if (runningApplicationInstances.count != 0) {
+        for (NSRunningApplication *runningApplication in runningApplicationInstances) {
+            DDLogWarn(@"Terminating %@", bundleID);
+            success = success || [runningApplication kill];
+        }
+    }
+    return success;
+}
+
+
+- (BOOL)kill
+{
+    return [self killReturningError:NULL];
+}
+
+// Like -kill, but hands the caller the NSError (and thus the errno) on failure. The prohibited-process
+// kill sites use this so M-A can classify a FAILED kill (docs/OS_UPDATE_RESILIENCE_PLAN.md §3.5): -kill
+// dropped the error, so an app-based kill site had no errno to work with.
+- (BOOL)killReturningError:(NSError **)outError
+{
+    if (self.terminated) {
+        DDLogVerbose(@"Process %@ already terminated", self);
+        return YES;
+    }
+    NSError *error = nil;
+    BOOL success = [NSRunningApplication killProcessWithPID:[self processIdentifier] error:&error];
+    DDLogVerbose(@"Success of terminating %@: %ld", self, (long)success);
+    if (!success) {
+        success = [self filterKillErrors:error];
+        if (!success && outError) { *outError = error; }
+    }
+    return success;
+}
+
+
+- (BOOL)filterKillErrors:(NSError*)error
+{
+    // (plan §3.4 / Q7) The WebKit-networking-process EPERM exception that lived here was DEAD CODE:
+    // measured on a 26.6.2 device, that process runs as the CHILD's uid, so its kill SUCCEEDS and EPERM
+    // is never produced — the branch could never match. It also keyed on a self-declared bundle
+    // identifier, the exact spoofable identity M-A forbids. Removed. A genuinely un-killable Apple
+    // system process is now handled by M-A at the kill sites, on a sound code-signature identity.
+    return NO;
+}
+
+
++ (BOOL)killProcessWithPID:(pid_t)processPID error:(NSError* _Nullable *)error
+{
+    NSInteger killSuccess = (NSInteger)kill(processPID, 9);
+    // Capture errno IMMEDIATELY, before anything else runs. errno is the whole point of this method,
+    // and every call below can overwrite the global errno as a side effect — stringWithFormat, the
+    // DDLog macros, and above all the NSLocalizedString(...) inside the userInfo dictionary literal
+    // (a cold Foundation bundle-table miss sets errno = ENOENT). Reading errno at the bottom therefore
+    // stored a corrupted value under SEBErrorKillProcessErrnoKey — on an English-locale Mac the very
+    // first kill failure of a session (before Foundation caches the miss) reported ENOENT (2) instead
+    // of the true EPERM (1). Callers that key on the errno (the prohibited-process handling, and any
+    // future kill-failure classification) were reading garbage on exactly the cold path that matters.
+    int savedErrno = errno;
+    NSString *localizedDescription;
+    NSString *debugDescription;
+    if (killSuccess == ESRCH) {
+        debugDescription = @"No such process.";
+        DDLogError(@"Couldn't terminate process: %@", debugDescription);
+        return YES;
+    } else if (killSuccess == -1) {
+        debugDescription = [NSString stringWithFormat:@"kill(9) success: %ld, errno: %d, error: %s", (long)killSuccess, savedErrno, strerror(savedErrno)];
+        localizedDescription = debugDescription;
+        if (savedErrno == 3) { // No such process (already terminated)
+            DDLogInfo(@"%@", debugDescription);
+            return YES;
+        } else {
+            DDLogError(@"%@", debugDescription);
+        }
+    } else if (killSuccess != ERR_SUCCESS) {
+        debugDescription = [NSString stringWithFormat:@"kill(9) not successful: %ld, errno: %d, error: %s", (long)killSuccess, savedErrno, strerror(savedErrno)];
+        localizedDescription = debugDescription;
+        DDLogError(@"%@", debugDescription);
+    } else {
+        DDLogVerbose(@"killProcessWithPID:%d Successfully terminated process", (int)processPID);
+        return YES;
+    }
+    if (error) {
+        *error = [NSError errorWithDomain:sebErrorDomain
+                                           code:SEBErrorKillProcessFailed
+                                       userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"%@: %@", NSLocalizedString(@"Couldn't terminate process: %@", @""), localizedDescription],
+                                                  NSDebugDescriptionErrorKey : [NSString stringWithFormat:@"Couldn't terminate process: %@", debugDescription],
+                                                  SEBErrorKillProcessSuccessKey: [NSNumber numberWithLong:killSuccess],
+                                                  SEBErrorKillProcessErrnoKey: [NSNumber numberWithInt:savedErrno]
+                                                }];
+    }
+    return NO;
+}
+
+@end
